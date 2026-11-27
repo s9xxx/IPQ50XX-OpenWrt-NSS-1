@@ -1,0 +1,445 @@
+name: Build ipq50xx (ipk · parallel)
+
+# Weekly Saturday build for every board listed in .github/ci/ipq50xx/{std,256m}.config.
+# One job per board (matrix, max-parallel 8), shared dl/ + ccache caches, ipk instead of apk,
+# Argon theme + iStore market + forced zh_cn. Images and per-board package tarballs are
+# attached to one draft release, which is published after all board jobs succeed.
+
+on:
+  schedule:
+    # 08:30 Beijing time every Saturday = 00:30 UTC Saturday
+    - cron: '30 0 * * 6'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (empty = ipq50xx-ipk-YYYY.MM.DD, UTC date)'
+        required: false
+        type: string
+
+concurrency:
+  group: build-ipq50xx-ipk-parallel
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TARGET: qualcommax/ipq50xx
+  CI_DIR: .github/ci/ipq50xx
+  RELEASE_PREFIX: ipq50xx-ipk
+  KEEP_RELEASES: '5'
+  TAG_RE: '^ipq50xx-ipk-[0-9]{4}\.[0-9]{2}\.[0-9]{2}(-[0-9]+)?$'
+
+jobs:
+  prepare:
+    name: Prepare draft release and board matrix
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      INPUT_TAG: ${{ inputs.tag }}
+    outputs:
+      tag: ${{ steps.draft.outputs.tag }}
+      devices: ${{ steps.meta.outputs.devices }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build board matrix and release notes
+        id: meta
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, re, os
+          sha = os.environ.get('GITHUB_SHA', 'unknown')[:12]
+          devs = []
+          for group in ('std', '256m'):
+              path = f'.github/ci/ipq50xx/{group}.config'
+              with open(path, encoding='utf-8') as f:
+                  for line in f:
+                      m = re.match(r'^CONFIG_TARGET_DEVICE_qualcommax_ipq50xx_DEVICE_([^=]+)=y\s*$', line)
+                      if m:
+                          devs.append({'device': m.group(1), 'group': group})
+          if not devs:
+              raise SystemExit('no ipq50xx boards found in CI configs')
+          with open('devices.json', 'w', encoding='utf-8') as f:
+              json.dump(devs, f, separators=(',', ':'))
+          board_list = ' '.join(d['device'] for d in devs)
+          note = f"""NSS offload for IPQ5018 boards (`qualcommax/ipq50xx`), ipk build of `{sha}`.
+          One job per board; 8 boards build in parallel.
+
+          **Packaging: ipk / opkg** (`CONFIG_USE_APK` disabled). General packages come from the
+          official OpenWrt ipk feeds written into `/etc/opkg/distfeeds.conf`; the board-specific
+          extra kmods are in `packages-<board>.tar.gz` attached to this release. Extract that
+          tarball on the router and install with `opkg install ./<package>.ipk` — kernel modules
+          only match an image from this same build.
+
+          **Sysupgrade images only.** Flash `openwrt-qualcommax-ipq50xx-<board>-squashfs-sysupgrade.bin`
+          over a running OpenWrt. Boards not in official OpenWrt need a plain OpenWrt image from
+          this tree first.
+
+          **Theme / market / language:** Argon (`luci-theme-argon`), iStore (`luci-app-store`),
+          `luci-i18n-base-zh-cn`, `zh_Hans` forced; first-boot script sets `/luci-static/argon`
+          and `zh_cn`. The previous Aurora theme is disabled.
+
+          **SQM in the NSS firmware** (`sqm-scripts-nss`, `nss-edma.qos`) is installed but off;
+          set the WAN queue and `enabled '1'` in `/etc/config/sqm`.
+
+          Boards ({len(devs)}): {board_list}
+          """
+          with open('release_notes.md', 'w', encoding='utf-8') as f:
+              f.write(note)
+          print(f'boards={len(devs)}')
+          PY
+          echo "devices=$(cat devices.json)" >>"$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        id: draft
+        run: |
+          set -euo pipefail
+          tag="$INPUT_TAG"
+          if [[ -z "$tag" ]]; then
+            base="${RELEASE_PREFIX}-$(date -u +%Y.%m.%d)"
+            tag="$base"; n=2
+            while gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+                  || git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; do
+              tag="${base}-${n}"; n=$((n+1))
+            done
+          fi
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
+            --title "$tag" --notes-file release_notes.md >&2
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.device.device }} (${{ matrix.device.group }})
+    needs: prepare
+    runs-on: ubuntu-26.04
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        device: ${{ fromJSON(needs.prepare.outputs.devices) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      DEVICE: ${{ matrix.device.device }}
+      GROUP: ${{ matrix.device.group }}
+    steps:
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update || true
+          sudo apt-get install -y bzip2 g++ gawk gcc git glibc-source libncurses-dev make rsync
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Feeds + Argon theme + iStore market
+        run: |
+          set -euo pipefail
+          grep -q '^src-git istore ' feeds.conf.default || \
+            echo 'src-git istore https://github.com/linkease/istore.git' >> feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          ./scripts/feeds install -d y -p istore luci-app-store || true
+          ./scripts/feeds install -d y -p istore luci-i18n-store-zh-cn || true
+          # Upstream luci feed does not ship luci-theme-argon on every branch; fall back to
+          # the sparse immortalwrt/luci copy, same trick as the other firmware repos.
+          if [ ! -d feeds/luci/themes/luci-theme-argon ]; then
+            tmp=$(mktemp -d)
+            got=0
+            for i in 1 2 3; do
+              if git clone -q --depth 1 --filter=blob:none --sparse \
+                   -b openwrt-24.10 https://github.com/immortalwrt/luci "$tmp/luci"; then
+                got=1; break
+              fi
+              echo "::warning::argon fallback clone attempt $i failed"
+              rm -rf "$tmp/luci"
+            done
+            [ "$got" = 1 ] || { echo "::error::cannot fetch luci-theme-argon"; exit 1; }
+            ( cd "$tmp/luci" && git sparse-checkout set themes/luci-theme-argon >/dev/null )
+            cp -a "$tmp/luci/themes/luci-theme-argon" feeds/luci/themes/
+            rm -rf "$tmp"
+            ./scripts/feeds update -i -a
+          fi
+          ./scripts/feeds install -p luci luci-theme-argon \
+            || { echo "::error::luci-theme-argon install failed"; exit 1; }
+          echo "✔ feeds / argon / istore ready"
+
+      - name: Assemble .config (ipk + one board + Argon + iStore)
+        run: |
+          set -euo pipefail
+          mkdir -p files/etc/opkg files/etc/uci-defaults
+          cat > files/etc/opkg/distfeeds.conf <<'EOF'
+          src/gz base https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/base
+          src/gz luci https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/luci
+          src/gz packages https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/packages
+          src/gz routing https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/routing
+          src/gz telephony https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/telephony
+          src/gz video https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/video
+          EOF
+          cat > files/etc/uci-defaults/99-argon-istore-zh <<'EOF'
+          #!/bin/sh
+          uci -q set luci.themes.Argon='/luci-static/argon'
+          uci -q set luci.main.mediaurlbase='/luci-static/argon'
+          uci -q set luci.main.lang='zh_cn'
+          uci -q commit luci
+          exit 0
+          EOF
+          chmod +x files/etc/uci-defaults/99-argon-istore-zh
+          {
+            cat "$CI_DIR/common.config"
+            grep -E '^CONFIG_(NSS_MEM_PROFILE|NSS_FIRMWARE_VERSION)' "$CI_DIR/${GROUP}.config"
+            cat "$CI_DIR/kmods-extra.config"
+            cat <<EOF2
+          # CONFIG_USE_APK is not set
+          CONFIG_PACKAGE_opkg=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-theme-argon=y
+          # CONFIG_PACKAGE_luci-theme-aurora is not set
+          CONFIG_PACKAGE_luci-app-store=y
+          CONFIG_PACKAGE_luci-i18n-store-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_TARGET_DEVICE_qualcommax_ipq50xx_DEVICE_${DEVICE}=y
+          EOF2
+          } > .config
+          make defconfig
+          if grep -q '^CONFIG_USE_APK=y$' .config; then
+            echo "::error::CONFIG_USE_APK still enabled"; exit 1
+          fi
+          for want in \
+            'CONFIG_PACKAGE_opkg=y' \
+            "CONFIG_TARGET_DEVICE_qualcommax_ipq50xx_DEVICE_${DEVICE}=y" \
+            'CONFIG_PACKAGE_luci-theme-argon=y' \
+            'CONFIG_PACKAGE_luci-app-store=y' \
+            'CONFIG_LUCI_LANG_zh_Hans=y'; do
+            grep -qxF "$want" .config || { echo "::error::config lost: $want"; exit 1; }
+          done
+          python3 - <<'PY'
+          import os, re, sys
+          cfg = open('.config', encoding='utf-8').read()
+          boards = set(re.findall(r'^CONFIG_TARGET_DEVICE_qualcommax_ipq50xx_DEVICE_([^=]+)=y', cfg, re.M))
+          built = set(re.findall(r'^CONFIG_PACKAGE_([^=]+)=[ym]', cfg, re.M))
+          path = 'tmp/info/.targetinfo-qualcommax'
+          info = open(path if os.path.exists(path) else 'tmp/.targetinfo', encoding='utf-8').read()
+          bad = 0
+          for blk in info.split('Target-Profile: DEVICE_')[1:]:
+              name = blk.split('\n', 1)[0].strip()
+              if name not in boards:
+                  continue
+              m = re.search(r'^Target-Profile-Packages:(.*)$', blk, re.M)
+              for pkg in (m.group(1).split() if m else []):
+                  if not pkg.startswith('-') and pkg not in built:
+                      print(f'::error::{name}: device package {pkg} is not selected')
+                      bad = 1
+          sys.exit(bad)
+          PY
+          ./scripts/diffconfig.sh >"diffconfig-${DEVICE}.txt"
+          echo "✔ config: ipk / $DEVICE / $GROUP / argon / istore"
+
+      - name: Restore source archives
+        id: dl-restore
+        uses: actions/cache/restore@v6
+        with:
+          path: dl
+          key: dl-ipq50xx-ipk-seed
+          restore-keys: |
+            dl-ipq50xx-ipk-
+
+      - name: Download sources
+        timeout-minutes: 75
+        env:
+          GIT_HTTP_LOW_SPEED_LIMIT: 1000
+          GIT_HTTP_LOW_SPEED_TIME: 60
+          CURL_OPTIONS: --speed-limit 1000 --speed-time 60
+        run: |
+          set -euo pipefail
+          ok=0
+          for attempt in 1 2 3; do
+            if timeout --kill-after=60 20m make download -j"$(nproc)"; then
+              ok=1; break
+            fi
+            echo "::warning::download attempt $attempt failed"
+            find dl -maxdepth 1 -name '*.dl' -printf '::warning::unfinished: %f (%s bytes)\n' || true
+            sleep 5
+          done
+          [ "$ok" = 1 ] || { echo "::error::download failed in 3 attempts"; exit 1; }
+
+      - name: Compute source archive key
+        id: dl-key
+        run: |
+          set -euo pipefail
+          sum=$(find dl/ -maxdepth 1 -type f ! -name '*.dl' ! -name '*.hash' -printf '%f %s\n' \
+                | LC_ALL=C sort | sha256sum | cut -c1-16)
+          key="dl-ipq50xx-ipk-${sum}"
+          echo "key=$key" >>"$GITHUB_OUTPUT"
+          if [ "$key" = "${{ steps.dl-restore.outputs.cache-matched-key }}" ]; then
+            echo "dl cache already current: $key"
+          else
+            echo "saving dl cache as $key"
+          fi
+
+      - name: Save source archives
+        if: steps.dl-key.outputs.key != steps.dl-restore.outputs.cache-matched-key
+        uses: actions/cache/save@v6
+        with:
+          path: dl
+          key: ${{ steps.dl-key.outputs.key }}
+
+      - name: Compute ccache key
+        id: ccache
+        run: |
+          set -euo pipefail
+          tree=$(git rev-parse HEAD:toolchain)
+          sum=$({ echo "$tree"; grep -E '^CONFIG_(BINUTILS|GCC|LIBC|MUSL)_' .config; \
+                  gcc --version; as --version; } | sha256sum | cut -c1-16)
+          echo "prefix=ccache-ipq50xx-ipk-${sum}-" >>"$GITHUB_OUTPUT"
+
+      - name: Restore ccache
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: ${{ steps.ccache.outputs.prefix }}${{ github.run_id }}-${{ matrix.device.device }}
+          restore-keys: ${{ steps.ccache.outputs.prefix }}
+
+      - name: Build firmware
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_COMPILERCHECK: content
+          CCACHE_MAXSIZE: 4G
+        run: |
+          set -euo pipefail
+          if ! make -j"$(nproc)"; then
+            make -j1 V=s 2>&1 | tail -300
+            exit 1
+          fi
+          staging_dir/host/bin/ccache -s || true
+          df -h / | tail -1
+
+      - name: Build ipk repository and stage release files
+        run: |
+          set -euo pipefail
+          out="bin/targets/${TARGET}"
+          # tree-local packages the official feeds do not carry
+          for pat in 'luci-app-nss-*.ipk' 'luci-i18n-nss-*.ipk'; do
+            for f in bin/packages/*/base/$pat; do
+              [ -e "$f" ] && cp "$f" "$out/packages/"
+            done
+          done
+          if grep -q '^CONFIG_PACKAGE_wpad-mesh-mbedtls=[my]' .config; then
+            for f in bin/packages/*/base/wpad-mesh-mbedtls-*.ipk; do
+              [ -e "$f" ] && cp "$f" "$out/packages/"
+            done
+          fi
+          make package/index
+          n_img=$(find "$out" -maxdepth 1 -name "openwrt-*-${DEVICE}-squashfs-sysupgrade.bin" | wc -l)
+          [ "$n_img" -eq 1 ] || { echo "::error::expected 1 sysupgrade image for $DEVICE, got $n_img"; exit 1; }
+          [ -f "$out/packages/Packages" ] || { echo "::error::no ipk package index"; exit 1; }
+          compgen -G "$out/packages/kmod-wireguard-*.ipk" >/dev/null \
+            || { echo "::error::kmod-wireguard missing from ipk repo"; exit 1; }
+          compgen -G "$out/packages/luci-app-nss-*.ipk" >/dev/null \
+            || { echo "::error::luci-app-nss missing from ipk repo"; exit 1; }
+          n_po=$(find package/nss/luci-app-nss/po -mindepth 1 -maxdepth 1 -type d ! -name templates | wc -l)
+          n_i18n=$(find "$out/packages" -maxdepth 1 -name 'luci-i18n-nss-*.ipk' | wc -l)
+          [ "$n_i18n" -eq "$n_po" ] \
+            || { echo "::error::$n_i18n luci-i18n-nss ipks for $n_po translations"; exit 1; }
+          if grep -q '^CONFIG_PACKAGE_wpad-mesh-mbedtls=[my]' .config; then
+            compgen -G "$out/packages/wpad-mesh-mbedtls-*.ipk" >/dev/null \
+              || { echo "::error::wpad-mesh-mbedtls missing from ipk repo"; exit 1; }
+          fi
+          echo "repository: $(find "$out/packages" -maxdepth 1 -name '*.ipk' | wc -l) ipk packages"
+          mkdir -p "release-${DEVICE}"
+          find "$out" -maxdepth 1 -type f \
+            \( -name 'openwrt-*-squashfs-sysupgrade.bin' \
+               -o -name 'openwrt-*-squashfs-factory-*.bin' \
+               -o -name 'openwrt-*-initramfs-factory.ubi' \) \
+            -exec cp {} "release-${DEVICE}/" \;
+          grep -E 'sysupgrade\.bin|squashfs-factory.*\.bin|initramfs-factory\.ubi' \
+            "$out/sha256sums" >"release-${DEVICE}/sha256sums-${DEVICE}.txt"
+          cp "$out/config.buildinfo" "release-${DEVICE}/config-${DEVICE}.buildinfo"
+          ./scripts/feeds list -fs >"release-${DEVICE}/feeds-${DEVICE}.buildinfo"
+          cp "diffconfig-${DEVICE}.txt" "release-${DEVICE}/"
+          tar -czf "release-${DEVICE}/packages-${DEVICE}.tar.gz" -C "$out/packages" .
+          ls -lh "release-${DEVICE}/"
+
+      - name: Upload board artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ matrix.device.device }}
+          path: release-${{ matrix.device.device }}/
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    name: Upload assets and publish release
+    needs: [prepare, build]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      BUILD_RESULT: ${{ needs.build.result }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: images-*
+          path: artifacts
+
+      - name: Publish or discard
+        run: |
+          set -euo pipefail
+          if [[ "$BUILD_RESULT" != "success" ]]; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes || true
+            echo "::error::build=$BUILD_RESULT; draft release discarded"
+            exit 1
+          fi
+          shopt -s nullglob
+          n=0
+          for d in artifacts/*; do
+            mapfile -t files < <(find "$d" -type f)
+            [ "${#files[@]}" -gt 0 ] || continue
+            ok=0
+            for attempt in 1 2 3; do
+              if gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${files[@]}"; then
+                ok=1; break
+              fi
+              echo "::warning::upload attempt $attempt failed for $d"
+              sleep 15
+            done
+            [ "$ok" = 1 ] || { echo "::error::upload failed for $d"; exit 1; }
+            n=$((n+1))
+          done
+          [ "$n" -gt 0 ] || { echo "::error::no board artifacts"; exit 1; }
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          echo "published $n board bundles to $TAG"
+
+      - name: Prune old releases
+        run: |
+          set -euo pipefail
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --exclude-drafts \
+            --json tagName,publishedAt \
+            | jq -r --arg re "$TAG_RE" --argjson keep "$KEEP_RELEASES" \
+                '[.[] | select(.tagName | test($re))] | sort_by(.publishedAt) | reverse | .[$keep:][] | .tagName' \
+            | while read -r old; do
+                echo "delete release $old"
+                gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+              done
