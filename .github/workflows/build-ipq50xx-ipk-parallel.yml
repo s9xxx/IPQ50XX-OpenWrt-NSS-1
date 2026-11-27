@@ -240,6 +240,12 @@ jobs:
           EOF2
           } > .config
           make defconfig
+          echo "===== DIAG: package Kconfig ====="
+          ls -l tmp/.config-package.in 2>&1 || true
+          grep -n -i 'luci-app-store' tmp/.config-package.in 2>&1 | head -30 || true
+          grep -n -i 'luci-lib-taskd' tmp/.config-package.in 2>&1 | head -20 || true
+          grep -n -i 'luci-app-store' .config 2>&1 | head -20 || true
+          ls -l package/feeds/istore/ 2>&1 | head -20 || true
           if grep -q '^CONFIG_USE_APK=y$' .config; then
             echo "::error::CONFIG_USE_APK still enabled"; exit 1
           fi
