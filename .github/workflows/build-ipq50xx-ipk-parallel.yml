@@ -15,6 +15,10 @@ on:
         description: 'Release tag (empty = ipq50xx-ipk-YYYY.MM.DD, UTC date)'
         required: false
         type: string
+      board:
+        description: 'Build only this board (empty = all boards from CI configs)'
+        required: false
+        type: string
 
 concurrency:
   group: build-ipq50xx-ipk-parallel
@@ -40,6 +44,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       INPUT_TAG: ${{ inputs.tag }}
+      INPUT_BOARD: ${{ inputs.board }}
     outputs:
       tag: ${{ steps.draft.outputs.tag }}
       devices: ${{ steps.meta.outputs.devices }}
@@ -63,6 +68,12 @@ jobs:
                           devs.append({'device': m.group(1), 'group': group})
           if not devs:
               raise SystemExit('no ipq50xx boards found in CI configs')
+          only = os.environ.get('INPUT_BOARD', '').strip()
+          if only:
+              devs = [d for d in devs if d['device'] == only]
+              if not devs:
+                  raise SystemExit(f'board not found in CI configs: {only}')
+              print(f'board filter: {only}')
           with open('devices.json', 'w', encoding='utf-8') as f:
               json.dump(devs, f, separators=(',', ':'))
           board_list = ' '.join(d['device'] for d in devs)
@@ -155,7 +166,9 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           ./scripts/feeds install -d y -p istore luci-app-store || true
-          ./scripts/feeds install -d y -p istore luci-i18n-store-zh-cn || true
+          # linkease/istore ships translations/zh-cn/app.po but no luci-i18n-store-zh-cn
+          # Makefile, so there is no such feed package to install. zh_cn is forced via
+          # CONFIG_LUCI_LANG_zh_Hans and the uci-defaults written below.
           # Upstream luci feed does not ship luci-theme-argon on every branch; fall back to
           # the sparse immortalwrt/luci copy, same trick as the other firmware repos.
           if [ ! -d feeds/luci/themes/luci-theme-argon ]; then
@@ -211,9 +224,18 @@ jobs:
           CONFIG_PACKAGE_luci-theme-argon=y
           # CONFIG_PACKAGE_luci-theme-aurora is not set
           CONFIG_PACKAGE_luci-app-store=y
-          CONFIG_PACKAGE_luci-i18n-store-zh-cn=y
           CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
           CONFIG_LUCI_LANG_zh_Hans=y
+          # luci-app-store dependencies must be selected explicitly; .config is rebuilt
+          # from scratch here, so the dependency choices made by `feeds install -d y`
+          # are gone and defconfig would otherwise drop luci-app-store.
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_tar=y
+          CONFIG_PACKAGE_libuci-lua=y
+          CONFIG_PACKAGE_mount-utils=y
+          CONFIG_PACKAGE_luci-lib-taskd=y
+          CONFIG_PACKAGE_luci-lib-xterm=y
+          CONFIG_PACKAGE_taskd=y
           CONFIG_TARGET_DEVICE_qualcommax_ipq50xx_DEVICE_${DEVICE}=y
           EOF2
           } > .config
@@ -226,8 +248,18 @@ jobs:
             "CONFIG_TARGET_DEVICE_qualcommax_ipq50xx_DEVICE_${DEVICE}=y" \
             'CONFIG_PACKAGE_luci-theme-argon=y' \
             'CONFIG_PACKAGE_luci-app-store=y' \
+            'CONFIG_PACKAGE_luci-lib-taskd=y' \
             'CONFIG_LUCI_LANG_zh_Hans=y'; do
-            grep -qxF "$want" .config || { echo "::error::config lost: $want"; exit 1; }
+            if ! grep -qxF "$want" .config; then
+              echo "::error::config lost: $want"
+              echo "===== .config ====="
+              grep -E '^(# )?CONFIG_PACKAGE_(luci-app-store|luci-lib-taskd|luci-lib-xterm|taskd|curl|libcurl|tar|libuci-lua|libuci|liblua|mount-utils|libmount|libblkid|libuuid|libsmartcols)' .config || true
+              echo "===== generated Kconfig ====="
+              grep -n -A14 '^config PACKAGE_luci-app-store$' tmp/.config-package.in || true
+              echo "===== istore Kconfig symbols ====="
+              grep -n '^config PACKAGE_' tmp/.config-package.in | grep -E 'istore|store|taskd' || true
+              exit 1
+            fi
           done
           python3 - <<'PY'
           import os, re, sys
