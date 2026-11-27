@@ -223,6 +223,9 @@ jobs:
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-theme-argon=y
           # CONFIG_PACKAGE_luci-theme-aurora is not set
+          # tar's default TAR_XZ pulls in xz-utils; luci-app-store depends on tar,
+          # so without this the defconfig drops luci-app-store entirely.
+          # CONFIG_PACKAGE_TAR_XZ is not set
           CONFIG_PACKAGE_luci-app-store=y
           CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
           CONFIG_LUCI_LANG_zh_Hans=y
@@ -240,12 +243,6 @@ jobs:
           EOF2
           } > .config
           make defconfig
-          echo "===== DIAG: package Kconfig ====="
-          ls -l tmp/.config-package.in 2>&1 || true
-          grep -n -A25 -i 'config PACKAGE_luci-app-store' tmp/.config-package.in 2>&1 | head -40 || true
-          grep -n -i 'luci-lib-taskd' tmp/.config-package.in 2>&1 | head -20 || true
-          grep -n -i 'luci-app-store' .config 2>&1 | head -20 || true
-          ls -l package/feeds/istore/ 2>&1 | head -20 || true
           if grep -q '^CONFIG_USE_APK=y$' .config; then
             echo "::error::CONFIG_USE_APK still enabled"; exit 1
           fi
